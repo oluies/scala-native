@@ -120,6 +120,9 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
 
     BlockAllocator_Init(&blockAllocator, blockMetaStart, initialBlockCount);
     Bytemap_Init(bytemap, heapStart, maxHeapSize);
+    Allocator_Init(&recycleDepot, &blockAllocator, bytemap, blockMetaStart,
+                   heapStart);
+    mutex_init(&recycleDepotLock);
     Heap_RefillEmergencyBlock(heap);
     char *statsFile = Settings_StatsFileName();
     if (statsFile != NULL) {
@@ -312,7 +315,7 @@ bool Heap_RecoverAllocation(Heap *heap, size_t size, uint64_t generation) {
 bool Heap_shouldGrow(Heap *heap) {
     uint32_t freeBlockCount = (uint32_t)blockAllocator.freeBlockCount;
     uint32_t blockCount = heap->blockCount;
-    uint32_t recycledBlockCount = 0;
+    uint32_t recycledBlockCount = recycleDepot.recycledBlockCount;
     MutatorThreads_foreach(mutatorThreads, node) {
         recycledBlockCount += node->value->allocator.recycledBlockCount;
     }
@@ -390,6 +393,7 @@ void Heap_Recycle(Heap *heap) {
         LargeAllocator_Clear(&thread->largeAllocator);
     }
     BlockAllocator_Clear(&blockAllocator);
+    Allocator_Clear(&recycleDepot);
 
     BlockMeta *current = (BlockMeta *)heap->blockMetaStart;
     word_t *currentBlockStart = heap->heapStart;
@@ -415,9 +419,7 @@ void Heap_Recycle(Heap *heap) {
             // Keep the empty reserve out of the allocator while it is held.
             BlockAllocator_SweepDone(&blockAllocator);
         } else if (BlockMeta_IsSimpleBlock(current)) {
-            MutatorThread *recycleBlocksTo = NextMutatorThread();
-            Block_Recycle(&recycleBlocksTo->allocator, current,
-                          currentBlockStart, lineMetas);
+            Block_Recycle(&recycleDepot, current, currentBlockStart, lineMetas);
         } else if (BlockMeta_IsSuperblockStart(current)) {
             size = BlockMeta_SuperblockSize(current);
             MutatorThread *recycleBlocksTo = NextMutatorThread();

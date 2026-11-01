@@ -149,6 +149,34 @@ static bool Allocator_reserveHole(Allocator *allocator, BlockMeta *block,
     return false;
 }
 
+static bool Allocator_reserveFrom(Allocator *allocator, Allocator *source,
+                                  size_t size) {
+    BlockList *list = &source->recycledBlocks;
+    BlockMeta *previous = NULL;
+    for (BlockMeta *block = list->first; block != NULL;) {
+        BlockMeta *next = BlockList_getNextBlock(list->blockMetaStart, block);
+        word_t *start = BlockMeta_GetBlockStart(allocator->blockMetaStart,
+                                                allocator->heapStart, block);
+        if (Allocator_reserveHole(allocator, block, start, size)) {
+            if (BlockMeta_FirstFreeLine(block) == LAST_HOLE) {
+                if (previous == NULL)
+                    list->first = next;
+                else
+                    BlockList_SetNext(list, previous, next);
+                if (list->last == block)
+                    list->last = previous;
+                block->nextBlock = LAST_BLOCK;
+                atomic_fetch_sub_explicit(&source->recycledBlockCount, 1,
+                                          memory_order_relaxed);
+            }
+            return true;
+        }
+        previous = block;
+        block = next;
+    }
+    return false;
+}
+
 // Sweep retains per-mutator allocation lists. Before growing or reporting OOM,
 // recover a suitable run even if sweep assigned it to an idle mutator. The
 // collection owner holds the stopped-world mutator-list lock throughout.
@@ -157,32 +185,11 @@ bool Allocator_ReserveRecycled(Allocator *allocator, size_t size) {
         Allocator_reserveHole(allocator, allocator->block,
                               allocator->blockStart, size))
         return true;
+    if (Allocator_reserveFrom(allocator, &recycleDepot, size))
+        return true;
     MutatorThreads_foreach(mutatorThreads, node) {
-        Allocator *source = &node->value->allocator;
-        BlockList *list = &source->recycledBlocks;
-        BlockMeta *previous = NULL;
-        for (BlockMeta *block = list->first; block != NULL;) {
-            BlockMeta *next =
-                BlockList_getNextBlock(list->blockMetaStart, block);
-            word_t *start = BlockMeta_GetBlockStart(
-                allocator->blockMetaStart, allocator->heapStart, block);
-            if (Allocator_reserveHole(allocator, block, start, size)) {
-                if (BlockMeta_FirstFreeLine(block) == LAST_HOLE) {
-                    if (previous == NULL)
-                        list->first = next;
-                    else
-                        BlockList_SetNext(list, previous, next);
-                    if (list->last == block)
-                        list->last = previous;
-                    block->nextBlock = LAST_BLOCK;
-                    atomic_fetch_sub_explicit(&source->recycledBlockCount, 1,
-                                              memory_order_relaxed);
-                }
-                return true;
-            }
-            previous = block;
-            block = next;
-        }
+        if (Allocator_reserveFrom(allocator, &node->value->allocator, size))
+            return true;
     }
     return false;
 }
@@ -222,8 +229,36 @@ bool Allocator_getNextLine(Allocator *allocator) {
  * Updates the the cursor and the limit of the Allocator to point to the
  * first free line of the new block.
  */
+/** Recycled blocks a thread takes from the depot at a time. */
+#define RECYCLE_MAGAZINE_BLOCKS 16
+
+/**
+ * Refills an empty local list with up to RECYCLE_MAGAZINE_BLOCKS blocks from
+ * the depot, so a thread holds at most one magazine of recycled blocks and an
+ * idle thread holds none. One lock per magazine rather than per block.
+ */
+static void Allocator_refillMagazine(Allocator *allocator) {
+    if (allocator == &recycleDepot || allocator->recycledBlocks.first != NULL ||
+        recycleDepot.recycledBlocks.first == NULL)
+        return;
+    mutex_lock(&recycleDepotLock);
+    uint32_t moved = 0;
+    BlockMeta *block;
+    while (moved < RECYCLE_MAGAZINE_BLOCKS &&
+           (block = BlockList_Poll(&recycleDepot.recycledBlocks)) != NULL) {
+        BlockList_AddLast(&allocator->recycledBlocks, block);
+        moved++;
+    }
+    atomic_fetch_sub_explicit(&recycleDepot.recycledBlockCount, moved,
+                              memory_order_relaxed);
+    mutex_unlock(&recycleDepotLock);
+    atomic_fetch_add_explicit(&allocator->recycledBlockCount, moved,
+                              memory_order_relaxed);
+}
+
 bool Allocator_newBlock(Allocator *allocator) {
     assert(allocator != NULL);
+    Allocator_refillMagazine(allocator);
     BlockMeta *block = BlockList_Poll(&allocator->recycledBlocks);
     word_t *blockStart;
 
