@@ -451,6 +451,12 @@ static void Synchronizer_afterForkChild(void) {
     MutatorThreads_afterForkChild();
     mutex_init(&heap.lock);
     mutex_init(&blockAllocator.allocationLock);
+#ifdef SCALANATIVE_GC_IMMIX
+    // A parent thread may have held the depot lock mid-refill, leaving its list
+    // inconsistent. Drop the depot; its blocks return at the next collection.
+    mutex_init(&recycleDepotLock);
+    Allocator_Clear(&recycleDepot);
+#endif
 #ifdef SCALANATIVE_GC_COMMIX
     // GC workers are gone; the child must exec or exit before another GC.
     mutex_init(&heap.sweep.growMutex);

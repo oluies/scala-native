@@ -177,9 +177,10 @@ static bool Allocator_reserveFrom(Allocator *allocator, Allocator *source,
     return false;
 }
 
-// Sweep retains per-mutator allocation lists. Before growing or reporting OOM,
-// recover a suitable run even if sweep assigned it to an idle mutator. The
-// collection owner holds the stopped-world mutator-list lock throughout.
+// Before growing or reporting OOM, recover a suitable run from recycled
+// blocks: the depot first, then each mutator's current magazine, including an
+// idle mutator's. The collection owner holds the stopped-world mutator-list
+// lock throughout.
 bool Allocator_ReserveRecycled(Allocator *allocator, size_t size) {
     if (size > LINE_SIZE && allocator->block != NULL &&
         Allocator_reserveHole(allocator, allocator->block,
@@ -226,10 +227,12 @@ bool Allocator_getNextLine(Allocator *allocator) {
 }
 
 /**
- * Updates the the cursor and the limit of the Allocator to point to the
- * first free line of the new block.
+ * Recycled blocks a thread takes from the depot at a time. The size trades
+ * lock traffic against blocks stranded with a thread that stops allocating:
+ * one depot acquisition per magazine, and at most this many blocks (512 KiB at
+ * 16) out of reach of the other threads until the next collection, though
+ * still reachable by Allocator_ReserveRecycled during recovery.
  */
-/** Recycled blocks a thread takes from the depot at a time. */
 #define RECYCLE_MAGAZINE_BLOCKS 16
 
 /**
@@ -260,6 +263,10 @@ static void Allocator_refillMagazine(Allocator *allocator) {
                               memory_order_relaxed);
 }
 
+/**
+ * Updates the the cursor and the limit of the Allocator to point to the
+ * first free line of the new block.
+ */
 bool Allocator_newBlock(Allocator *allocator) {
     assert(allocator != NULL);
     Allocator_refillMagazine(allocator);
@@ -329,7 +336,8 @@ NOINLINE word_t *Allocator_allocSlow(Allocator *allocator, Heap *heap,
             return object;
         }
         // Asking counts as allocating: a thread waiting on another thread's
-        // recovery collection must still receive recycled blocks.
+        // recovery collection must still receive swept large-object chunks.
+        // Small recycled blocks come from the depot and need no such signal.
         allocator->blocksTaken++;
         if (!Heap_RecoverAllocation(heap, size, generation))
             Heap_ThrowOutOfMemory(heap);

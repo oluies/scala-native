@@ -344,9 +344,10 @@ static bool Heap_allocatedSinceCollection(MutatorThread *thread) {
 }
 
 /**
- * The threads that receive partly free blocks in this collection: the
+ * The threads that receive swept large-object chunks in this collection: the
  * collecting thread, then every thread that took or asked for space since the
- * last one. A thread that did neither (parked, sleeping, waiting for work)
+ * last one. Partly free small-object blocks go to the depot instead (see
+ * recycleDepot). A thread that did neither (parked, sleeping, waiting for work)
  * would hold its share until the next collection, out of reach of the threads
  * that allocate, so it is left out. Thread state cannot tell the two apart:
  * every stopped thread is Unmanaged by now. Built once per collection, so
