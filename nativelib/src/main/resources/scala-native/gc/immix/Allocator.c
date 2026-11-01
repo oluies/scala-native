@@ -238,8 +238,12 @@ bool Allocator_getNextLine(Allocator *allocator) {
  * idle thread holds none. One lock per magazine rather than per block.
  */
 static void Allocator_refillMagazine(Allocator *allocator) {
+    // The quick check reads the depot's count, an atomic, rather than its
+    // list head, which other threads change under recycleDepotLock. A stale
+    // count costs at most one empty lock acquisition or one missed refill.
     if (allocator == &recycleDepot || allocator->recycledBlocks.first != NULL ||
-        recycleDepot.recycledBlocks.first == NULL)
+        atomic_load_explicit(&recycleDepot.recycledBlockCount,
+                             memory_order_acquire) == 0)
         return;
     mutex_lock(&recycleDepotLock);
     uint32_t moved = 0;
